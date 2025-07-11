@@ -308,6 +308,8 @@ export class tools extends plugin {
         this.queue = new PQueue({ concurrency: Number(this.toolsConfig.queueConcurrency) });
         // 视频下载的并发数量
         this.videoDownloadConcurrency = this.toolsConfig.videoDownloadConcurrency;
+        // ai总结 先获取网页
+        this.aiWebFetch = this.toolsConfig.aiWebFetch;
         // ai接口
         this.aiBaseURL = this.toolsConfig.aiBaseURL;
         // ai api key
@@ -2684,97 +2686,28 @@ export class tools extends plugin {
             .setBaseURL(this.aiBaseURL)
             .setApiKey(this.aiApiKey)
             .setModel(this.aiModel)
-            .setPrompt(SUMMARY_PROMPT);
+            .setPrompt(SUMMARY_PROMPT)
+            .build();
+        e.reply(`${ this.identifyPrefix }识别：${ name }，正在为您总结，请稍等...`, true, { recallMsg: MESSAGE_RECALL_TIME });
 
-        if (this.aiModel.includes('deepseek')) {
-            builder.setProvider('deepseek');
-        }
-
-        await builder.build();
-
-        e.reply(`${this.identifyPrefix}识别：${name}，正在为您总结，请稍等...`, true);
-
-        let messages = [{ role: "user", content: summaryLink }];
-
-        // 兜底策略：检测模型是否支持 tool_calls
-        if (!this.aiModel.includes("kimi") && !this.aiModel.includes("moonshot")) {
-            // 不支持 tool_calls 的模型，直接爬取内容并总结
+        let result;
+        if (this.aiWebFetch) {
             try {
-                // 直接使用llmRead爬取链接内容
-                const crawled_content = await llmRead(summaryLink);
-                // 重新构造消息，将爬取到的内容直接放入对话历史
-                messages = [
-                    { role: "user", content: `这是网页链接: ${summaryLink}` },
-                    { role: "assistant", content: `好的，我已经爬取了网页内容，内容如下：\n${crawled_content}` },
-                    { role: "user", content: "请根据以上内容进行总结。" }
-                ];
-                
-                // 调用kimi进行总结，此时不传递任何工具
-                const response = await builder.chat(messages); // 不传递 CRAWL_TOOL
-                const { ans: kimiAns, model } = response;
-                // 估算阅读时间并提取标题
-                const stats = estimateReadingTime(kimiAns);
-                const titleMatch = kimiAns.match(/(Title|标题)([:：])\s*(.*)/)?.[3];
-                e.reply(`《${titleMatch || '未知标题'}》 预计阅读时间: ${stats.minutes} 分钟，总字数: ${stats.words}`);
-                // 将总结内容格式化为合并转发消息
-                const Msg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [`「R插件 x ${model}」联合为您总结内容：`, kimiAns]));
-                await e.reply(Msg);
+                result = await builder.openai(summaryLink);
             } catch (error) {
-                e.reply(`总结失败: ${error.message}`);
+                logger.warn('[R插件][AI总结] OpenAI接口调用失败', error.message);
             }
-            return true;
+        } else {
+            result = await builder.kimi(summaryLink);
         }
 
-        // 为了防止无限循环，设置一个最大循环次数
-        for (let i = 0; i < 5; i++) { 
-            const response = await builder.chat(messages, [CRAWL_TOOL]);
-
-            // 如果Kimi返回了工具调用
-            if (response.tool_calls) {
-                const tool_calls = response.tool_calls;
-                messages.push({
-                    role: 'assistant',
-                    content: null,
-                    tool_calls: tool_calls,
-                });
-
-                // 遍历并处理每一个工具调用
-                for (const tool_call of tool_calls) {
-                    if (tool_call.function.name === 'crawl') {
-                        try {
-                            const args = JSON.parse(tool_call.function.arguments);
-                            const urlToCrawl = args.url;
-                            // 执行爬取操作
-                            const crawled_content = await llmRead(urlToCrawl);
-                            messages.push({
-                                role: 'tool',
-                                tool_call_id: tool_call.id,
-                                name: 'crawl',
-                                content: crawled_content,
-                            });
-                        } catch (error) {
-                             messages.push({
-                                role: 'tool',
-                                tool_call_id: tool_call.id,
-                                name: 'crawl',
-                                content: `爬取错误: ${error.message}`,
-                            });
-                        }
-                    }
-                }
-            } else {
-                // 如果没有工具调用，说明得到了最终的总结
-                const { ans: kimiAns, model } = response;
-                // 计算阅读时间
-                const stats = estimateReadingTime(kimiAns);
-                const titleMatch = kimiAns.match(/(Title|标题)([:：])\s*(.*?)\n/)?.[3];
-                e.reply(`《${titleMatch || '未知标题'}》 预计阅读时间: ${stats.minutes} 分钟，总字数: ${stats.words}`);
-                const Msg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [`「R插件 x ${model}」联合为您总结内容：`, kimiAns]));
-                await e.reply(Msg);
-                return true;
-            }
-        }
-        e.reply("处理超出限制，请重试");
+        const { ans: aiAns, model } = result;
+        // 计算阅读时间
+        const stats = estimateReadingTime(aiAns);
+        const titleMatch = aiAns.match(/(Title|标题)([:：])\s*(.*?)\n/)?.[3];
+        e.reply(`《${ titleMatch }》 预计阅读时间: ${ stats.minutes } 分钟，总字数: ${ stats.words }`);
+        const Msg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [`「R插件 x ${ model }」联合为您总结内容：`, aiAns]));
+        await e.reply(Msg);
         return true;
     }
 
